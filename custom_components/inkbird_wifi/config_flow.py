@@ -29,14 +29,7 @@ REGION_OPTIONS = {k: k.upper() for k in REGIONS}
 STEP_CLOUD_SCHEMA = vol.Schema({
     vol.Required(CONF_USERNAME): str,
     vol.Required(CONF_PASSWORD): str,
-    vol.Required("country_code", default="1"): str,
-    vol.Required("region", default=DEFAULT_REGION): vol.In(REGION_OPTIONS),
-})
-
-STEP_GOOGLE_SCHEMA = vol.Schema({
-    vol.Required(CONF_USERNAME): str,
-    vol.Required("google_sub"): str,
-    vol.Required("country_code", default="1"): str,
+    vol.Required("country_code", default="49"): str,
     vol.Required("region", default=DEFAULT_REGION): vol.In(REGION_OPTIONS),
 })
 
@@ -55,22 +48,6 @@ def _find_lan_ip(dev_id: str) -> str | None:
     return None
 
 
-def _extract_google_sub(value: str) -> str | None:
-    """Return the Google `sub` claim — accepts an idToken JWT or a bare numeric sub."""
-    value = value.strip()
-    if value.isdigit() and 5 < len(value) < 30:
-        return value
-    parts = value.split(".")
-    if len(parts) != 3:
-        return None
-    try:
-        payload = parts[1] + "=" * ((4 - len(parts[1]) % 4) % 4)
-        data = json.loads(base64.urlsafe_b64decode(payload).decode())
-        return data.get("sub")
-    except Exception:
-        return None
-
-
 class InkbirdWifiConfigFlow(ConfigFlow, domain=DOMAIN):
     VERSION = 1
 
@@ -83,10 +60,7 @@ class InkbirdWifiConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        return self.async_show_menu(
-            step_id="user",
-            menu_options=["cloud", "google"],
-        )
+        return await self.async_step_cloud()
 
     async def _finish_login(self, devices: list[TuyaDevice]) -> ConfigFlowResult:
         # Filter to products we have a decoder for. Surface unknown ones in the
@@ -150,43 +124,7 @@ class InkbirdWifiConfigFlow(ConfigFlow, domain=DOMAIN):
     async def async_step_google(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
-        errors: dict[str, str] = {}
-        if user_input is not None:
-            sub = _extract_google_sub(user_input["google_sub"])
-            if not sub:
-                errors["google_sub"] = "invalid_token"
-            else:
-                session = aiohttp.ClientSession()
-                try:
-                    _, devices = await login_and_list_devices(
-                        session,
-                        user_input[CONF_USERNAME],
-                        google_sub=sub,
-                        region=user_input["region"],
-                        country_code=user_input["country_code"],
-                    )
-                    self._auth_data = {
-                        CONF_EMAIL:        user_input[CONF_USERNAME],
-                        CFG_PASSWORD:      "",
-                        CONF_GOOGLE_SUB:   sub,
-                        CONF_REGION:       user_input["region"],
-                        CONF_COUNTRY_CODE: user_input["country_code"],
-                    }
-                    return await self._finish_login(devices)
-                except TuyaCloudError as err:
-                    _LOGGER.warning("Google bridge login failed: %s", err)
-                    errors["base"] = "cannot_connect"
-                except Exception:
-                    _LOGGER.exception("Unexpected error during Google bridge login")
-                    errors["base"] = "unknown"
-                finally:
-                    await session.close()
-
-        return self.async_show_form(
-            step_id="google",
-            data_schema=STEP_GOOGLE_SCHEMA,
-            errors=errors,
-        )
+        return self.async_abort(reason="no_devices")
 
     async def async_step_pick_device(
         self, user_input: dict[str, Any] | None = None

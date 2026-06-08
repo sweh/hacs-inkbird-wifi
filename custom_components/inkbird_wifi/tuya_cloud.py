@@ -1,12 +1,11 @@
 """Tuya consumer-cloud client for the INKBIRD app (com.inkbird.inkbirdapp).
 
 End-to-end verified flow:
-  1. INKBIRD backend (api-inkbird.com) login → returns user record (uid, thirdUid).
+  1. INKBIRD backend (api-inkbird.com) login → returns user record (uid, tuyaUid).
   2. Tuya `smartlife.m.user.username.token.get` v2.0 → returns RSA public key + token.
-  3. RSA-encrypt MD5(OEM_PASSWORD) with that public key.
+  3. RSA-encrypt MD5(input password) with that public key.
   4. Tuya `smartlife.m.user.uid.password.login.reg` v1.0 → returns Tuya session.
-  5. `tuya.m.location.list` v2.1 → list user's homes/groups.
-  6. `tuya.m.my.group.device.list` v1.0 (gid as signed query param) → devices + localKey.
+  5. Call single Tuya APIs to get device list and DP102 (temperature) data.
 
 Crypto (all verified against live emulator hooks):
   - Sign: HMAC-SHA256(SIGN_KEY, sorted-joined-params) — see findings.md
@@ -28,7 +27,7 @@ import os
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterable
 
 import aiohttp
 from Crypto.Cipher import AES, PKCS1_v1_5
@@ -153,6 +152,58 @@ def _rsa_encrypt(plaintext: bytes, modulus: int, exponent: int) -> str:
     return PKCS1_v1_5.new(key).encrypt(plaintext).hex()
 
 
+def _recursive_find_dp102(node: Any) -> Iterable[str]:
+    """Recursively find DP 102 data (temperature readings) in device list."""
+    if isinstance(node, dict):
+        # common Tuya shapes
+        dps = node.get("dps")
+        if isinstance(dps, dict) and "102" in dps and isinstance(dps["102"], str):
+            yield dps["102"]
+        data_point_info = node.get("dataPointInfo")
+        if isinstance(data_point_info, dict):
+            dps2 = data_point_info.get("dps")
+            if isinstance(dps2, dict) and "102" in dps2 and isinstance(dps2["102"], str):
+                yield dps2["102"]
+        for value in node.values():
+            yield from _recursive_find_dp102(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from _recursive_find_dp102(item)
+
+
+@dataclass
+class Reading:
+    """Temperature and humidity reading from a sensor."""
+    name: str
+    temperature_c: float | None
+    humidity_percent: float | None
+    raw: bytes
+
+
+def decode_dp102(dp102_b64: str) -> list[Reading]:
+    """Decode DP 102 base64 blob containing 51-byte sensor records."""
+    blob = base64.b64decode(dp102_b64)
+    records: list[Reading] = []
+    size = 51
+    for offset in range(0, len(blob), size):
+        rec = blob[offset:offset + size]
+        if len(rec) < size:
+            continue
+        temp_raw = int.from_bytes(rec[9:11], "little", signed=True)
+        hum_raw = int.from_bytes(rec[11:13], "little", signed=True)
+        name = rec[36:51].split(b"\x00", 1)[0].decode("utf-8", errors="ignore") or f"sensor_{offset//size}"
+        # The app uses /10 for temperature and humidity.
+        records.append(Reading(
+            name=name,
+            temperature_c=temp_raw / 10.0,
+            humidity_percent=hum_raw / 10.0,
+            raw=rec,
+        ))
+    return records
+
+
+
+
 # ------------------------------------------------------------------
 # Tuya HTTP client
 # ------------------------------------------------------------------
@@ -179,6 +230,8 @@ class TuyaCloud:
         self._url = REGIONS.get(region, REGIONS[DEFAULT_REGION])
         self._sid: str | None = None
         self._ecode: str | None = None
+        self._gid: str | None = None
+        self._uid: str | None = None
 
     async def _call(
         self,
@@ -256,7 +309,108 @@ class TuyaCloud:
             )
         return result
 
-    # ------------- session lifecycle -------------
+    # ------------- session lifecycle (new flow) -------------
+
+    async def login_with_inkbird(self, username: str, password: str, country_code: str) -> None:
+        """Login using Inkbird credentials directly.
+
+        Flow:
+          1. Inkbird login
+          2. Tuya token.get
+          3. Tuya login.reg with RSA(MD5(input password))
+        """
+        # Step 1: Inkbird login
+        body = {
+            "countryCode": country_code,
+            "deviceType": 2,
+            "password": password,
+            "registerType": 1,
+            "username": username,
+        }
+        async with self._session.post(
+            f"{INKBIRD_BASE}/smartAgent/user/login",
+            json=body,
+            headers=INKBIRD_HEADERS,
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            envelope = await resp.json(content_type=None)
+
+        if envelope.get("code") != 200:
+            raise TuyaCloudError(
+                f"INKBIRD login failed ({envelope.get('code')}): "
+                f"{envelope.get('message') or envelope.get('msg') or envelope}"
+            )
+
+        _LOGGER.info("Inkbird login ok")
+
+        # Step 2: Tuya token.get
+        token_info = await self._call(
+            "smartlife.m.user.username.token.get",
+            "2.0",
+            {"countryCode": country_code, "isUid": True, "username": username},
+        )
+
+        # Step 3: Tuya login.reg with RSA-encrypted password
+        md5_pw = hashlib.md5(password.encode()).hexdigest().encode()
+        enc_pw = _rsa_encrypt(md5_pw, int(token_info["publicKey"]), int(token_info["exponent"]))
+
+        login_result = await self._call(
+            "smartlife.m.user.uid.password.login.reg",
+            "1.0",
+            {
+                "countryCode": country_code,
+                "createGroup": True,
+                "ifencrypt": 1,
+                "options": '{"group": 1}',
+                "passwd": enc_pw,
+                "token": token_info["token"],
+                "uid": username,
+            },
+        )
+        self._sid = login_result["sid"]
+        self._ecode = login_result["ecode"]
+        self._gid = str(login_result["gid"])
+        self._uid = login_result["uid"]
+        _LOGGER.info("Tuya login ok: uid=%s gid=%s", self._uid, self._gid)
+
+    # ------------- device discovery (new flow) -------------
+
+    async def call_single_device_actions(self) -> list[dict[str, Any]]:
+        """Call the APIs as normal single Tuya requests instead of batch.
+
+        Returns list of results with device data.
+        """
+        if not self._gid:
+            raise TuyaCloudError("Not logged in")
+
+        body = {"gid": int(self._gid)}
+        calls = [
+            ("m.life.my.group.device.list", "2.2"),
+        ]
+        results: list[dict[str, Any]] = []
+        for action, version in calls:
+            try:
+                result = await self._call(action, version, body, require_session=True)
+                _LOGGER.info("Single call %s v%s succeeded", action, version)
+                _LOGGER.debug("Single call %s v%s result=%s", action, version, json.dumps(result, ensure_ascii=False)[:5000])
+                results.append({"a": action, "v": version, "success": True, "result": result})
+            except TuyaCloudError as exc:
+                _LOGGER.info("Single call %s v%s failed: %s", action, version, exc)
+                results.append({"a": action, "v": version, "success": False, "error": str(exc)})
+        return results
+
+    async def get_readings(self) -> list[Reading]:
+        """Get temperature readings from all sensors."""
+        results = await self.call_single_device_actions()
+        all_readings: list[Reading] = []
+        for response in results:
+            for dp102 in _recursive_find_dp102(response):
+                all_readings.extend(decode_dp102(dp102))
+        if not all_readings:
+            _LOGGER.warning("No DP102 found in single-call responses")
+        return all_readings
+
+    # ------------- legacy session lifecycle (kept for compatibility) -------------
 
     async def login_with_tuya_uid(self, country_code: str, tuya_uid: str) -> None:
         """Bridge a Tuya-side uid (e.g. "1_<google_sub>") into a Tuya cloud session.
@@ -439,50 +593,6 @@ def _parse_device(d: dict[str, Any]) -> TuyaDevice:
 
 
 # ------------------------------------------------------------------
-# INKBIRD backend bridge
-# ------------------------------------------------------------------
-
-async def inkbird_login(
-    session: aiohttp.ClientSession,
-    username: str,
-    password: str = "",
-    *,
-    country_code: str = "1",
-    third_uid: str = "",
-) -> dict[str, Any]:
-    """Authenticate against INKBIRD's own backend. Returns the user record.
-
-    For email + password accounts: pass `password`, leave `third_uid` empty,
-    use registerType=1 (the call uses 2 if third_uid is provided).
-
-    For Google-only accounts: pass `username` (email), `third_uid` = Google
-    `sub`, and an empty `password` — the backend looks up the linked record.
-    """
-    body = {
-        "username":         username,
-        "password":         password,
-        "countryCode":      country_code,
-        "deviceType":       2,
-        "registerType":     2 if third_uid else 1,
-        "thirdUid":         third_uid,
-        "originalThirdUid": third_uid,
-    }
-    async with session.post(
-        f"{INKBIRD_BASE}/smartAgent/user/login",
-        json=body,
-        headers=INKBIRD_HEADERS,
-    ) as resp:
-        envelope = await resp.json(content_type=None)
-
-    if envelope.get("code") != 200:
-        raise TuyaCloudError(
-            f"INKBIRD login failed ({envelope.get('code')}): "
-            f"{envelope.get('message') or envelope.get('msg') or envelope}"
-        )
-    return envelope.get("data", {})
-
-
-# ------------------------------------------------------------------
 # Top-level convenience
 # ------------------------------------------------------------------
 
@@ -496,28 +606,16 @@ async def login_and_list_devices(
     country_code: str = "1",
 ) -> tuple[TuyaCloud, list[TuyaDevice]]:
     """End-to-end:
-      INKBIRD backend login → derive Tuya uid → Tuya login → list devices.
+      INKBIRD backend login → Tuya login → list devices.
 
-    For Google-only accounts, pass `google_sub` (the Google account ID, the JWT
-    `sub` claim). For email/password accounts, pass `password` and leave
-    `google_sub` empty.
+    For email/password accounts, pass `password`. Google login is no longer supported.
     """
-    data = await inkbird_login(
-        session, email, password,
-        country_code=country_code, third_uid=google_sub,
-    )
-    user = data.get("user", {}) or {}
-    third_uid = user.get("thirdUid") or (f"1_{google_sub}" if google_sub else "")
-    # The Tuya-side uid is always "1_" + Google sub for Google-bridged users.
-    # For email/password users, the user record's `tuyaUid` field has it.
-    tuya_uid = user.get("tuyaUid") or third_uid
-    if not tuya_uid:
-        raise TuyaCloudError(
-            "INKBIRD login succeeded but no Tuya uid linked; "
-            "for Google accounts pass google_sub explicitly."
-        )
-
-    cloud = TuyaCloud(session, region=region)
-    await cloud.login_with_tuya_uid(country_code, tuya_uid)
-    devices = await cloud.list_devices()
-    return cloud, devices
+    if password:
+        # New flow: direct Inkbird login with password
+        cloud = TuyaCloud(session, region=region)
+        await cloud.login_with_inkbird(email, password, country_code)
+        # For the new flow, we still return an empty device list from list_devices
+        # The integration will use get_readings() directly
+        return cloud, []
+    else:
+        raise TuyaCloudError("Only email+password authentication is supported")
