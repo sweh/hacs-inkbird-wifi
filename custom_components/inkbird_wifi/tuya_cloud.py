@@ -290,7 +290,10 @@ class TuyaCloud:
             "User-Agent":   APP_USER_AGENT,
             "Content-Type": "application/x-www-form-urlencoded",
         }
-        async with self._session.post(self._url, data=params, headers=headers) as resp:
+        async with self._session.post(
+            self._url, data=params, headers=headers,
+            timeout=aiohttp.ClientTimeout(total=20)
+        ) as resp:
             text = await resp.text()
             if resp.status != 200 or "SING_VALIDATE_FALED" in text:
                 raise TuyaCloudError(f"HTTP {resp.status}: {text[:300]}")
@@ -614,8 +617,34 @@ async def login_and_list_devices(
         # New flow: direct Inkbird login with password
         cloud = TuyaCloud(session, region=region)
         await cloud.login_with_inkbird(email, password, country_code)
-        # For the new flow, we still return an empty device list from list_devices
-        # The integration will use get_readings() directly
-        return cloud, []
+        
+        # Try to get device list using the legacy path first
+        try:
+            devices = await cloud.list_devices()
+            if devices:
+                return cloud, devices
+        except Exception as err:
+            _LOGGER.debug("Legacy device list failed, falling back to readings: %s", err)
+        
+        # Fallback: get readings to detect sensors
+        readings = await cloud.get_readings()
+        if not readings:
+            raise TuyaCloudError("No devices or sensors found")
+        
+        # Create virtual TuyaDevice entries for each sensor
+        devices = []
+        for i, reading in enumerate(readings):
+            # Create a virtual device for each sensor
+            device = TuyaDevice(
+                dev_id=f"inkbird_sensor_{i}",
+                local_key="",
+                ip="",
+                name=reading.name,
+                product_id="inkbird_sensor",
+                online=True,
+            )
+            devices.append(device)
+        
+        return cloud, devices
     else:
         raise TuyaCloudError("Only email+password authentication is supported")

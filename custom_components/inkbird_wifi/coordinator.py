@@ -43,7 +43,6 @@ from .tuya_cloud import (
     DEFAULT_REGION,
     TuyaCloud,
     TuyaCloudError,
-    inkbird_login,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -196,7 +195,7 @@ class InkbirdWifiCoordinator(DataUpdateCoordinator[CoordinatorData]):
         return bool(self._host and self._local_key)
 
     def _has_cloud_creds(self) -> bool:
-        return bool(self._email and (self._google_sub or self._password))
+        return bool(self._email and self._password)
 
     # --- LAN ---
     async def _try_lan(self) -> CoordinatorData | None:
@@ -249,21 +248,12 @@ class InkbirdWifiCoordinator(DataUpdateCoordinator[CoordinatorData]):
             return self._cloud
         if self._session is None:
             self._session = async_get_clientsession(self.hass)
-        data = await inkbird_login(
-            self._session, self._email,
-            password=self._password,
-            country_code=self._country_code,
-            third_uid=self._google_sub,
-        )
-        user = data.get("user", {}) or {}
-        third_uid = user.get("thirdUid") or (
-            f"1_{self._google_sub}" if self._google_sub else ""
-        )
-        tuya_uid = user.get("tuyaUid") or third_uid
-        if not tuya_uid:
-            raise UpdateFailed("Cannot derive Tuya uid for cloud fallback")
+        
+        # Use the new direct Inkbird login flow with password
         cloud = TuyaCloud(self._session, region=self._region)
-        await cloud.login_with_tuya_uid(self._country_code, tuya_uid)
+        await cloud.login_with_inkbird(
+            self._email, self._password, self._country_code
+        )
         self._cloud = cloud
         return cloud
 
